@@ -363,6 +363,35 @@ jobs:
         id: skin_polarity_tests
         run: python scripts/test-verify-skin-polarity.py
 
+      # ---- fork-owned (OpenWebUI tool) gates ----
+      - name: Verify OWUI design digest
+        if: always()
+        id: owui_digest
+        shell: bash
+        run: |
+          python scripts/build-owui-context.py
+          git diff --ignore-space-at-eol --exit-code -- \
+            scripts/owui-context-digest.json \
+            tools/diagram_design_tool.py
+          python scripts/test-verify-owui-context.py
+          python scripts/test-verify-owui-tool.py
+          python scripts/test-verify-owui-docs.py
+
+      # The validation fixture generator's oracle is bytes. Its corpus is plain text
+      # — LF-forced writes, sorted() iteration, a string-only manifest — and
+      # re-running the generator is byte-identical, so one platform is enough.
+      # Keeping the diff on a single leg is belt-and-braces against untested
+      # platform encoders and line endings, and it keeps the byte oracle
+      # single-sourced the way lint-render's pixel oracle is. The other matrix legs
+      # still run the full suites via the owui_digest step above.
+      - name: Verify OWUI validation fixture bytes
+        if: always() && matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        id: owui_fixture_diff
+        shell: bash
+        run: |
+          python scripts/build-validation-fixtures.py
+          git diff --ignore-space-at-eol --exit-code -- scripts/fixtures/validation/
+
       # lint-render.py's oracle is pixels, so the browser is part of the contract:
       # pin Playwright exactly, and let that pin choose the Chromium build. Bump
       # both together, deliberately, by editing PLAYWRIGHT_VERSION.
@@ -457,6 +486,8 @@ jobs:
           echo "| Beeswarm Checker | ${{ steps.beeswarm_tests.outcome == 'success' && '✅ Passed' || (steps.beeswarm_tests.outcome == 'skipped' && '⏭️ Skipped' || '❌ Failed') }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Tone Claim vs Ramp Polarity | ${{ steps.skin_polarity.outcome == 'success' && '✅ Passed' || (steps.skin_polarity.outcome == 'skipped' && '⏭️ Skipped' || '❌ Failed') }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Skin Polarity Checker | ${{ steps.skin_polarity_tests.outcome == 'success' && '✅ Passed' || (steps.skin_polarity_tests.outcome == 'skipped' && '⏭️ Skipped' || '❌ Failed') }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| OWUI Design Digest | ${{ steps.owui_digest.outcome == 'success' && '✅ Passed' || (steps.owui_digest.outcome == 'skipped' && '⏭️ Skipped' || '❌ Failed') }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| OWUI Validation Fixture Bytes | ${{ steps.owui_fixture_diff.outcome == 'success' && '✅ Passed' || (steps.owui_fixture_diff.outcome == 'skipped' && '⏭️ Skipped' || '❌ Failed') }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Primitive Icons & Documentation | ${{ steps.icons.outcome == 'success' && '✅ Passed' || (steps.icons.outcome == 'skipped' && '⏭️ Skipped' || '❌ Failed') }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Render Linter Self-Test | ${{ steps.render_selftest.outcome == 'success' && '✅ Passed' || (steps.render_selftest.outcome == 'skipped' && '⏭️ Skipped' || '❌ Failed') }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Rendered Layout (paint oracle) | ${{ steps.render.outcome == 'success' && '✅ Passed' || (steps.render.outcome == 'skipped' && '⏭️ Skipped' || '❌ Failed') }} |" >> $GITHUB_STEP_SUMMARY
