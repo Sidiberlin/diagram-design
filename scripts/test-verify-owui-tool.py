@@ -45,6 +45,14 @@ from pathlib import Path
 # probes): no `__pycache__` may land in the tree as a side effect of testing.
 sys.dont_write_bytecode = True
 
+# Windows CI (run 35117831059): run every audited call on the Selector loop.
+# This is noise reduction only — the Selector loop still builds a socketpair
+# wakeup on Windows, so the narrow selfpipe filter in _denylist_hook below
+# remains the actual guarantee that host-runtime sockets are not mistaken for
+# tool I/O (and that real tool sockets are not excused).
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 ROOT = Path(__file__).resolve().parent.parent
 BUILD_SCRIPT = ROOT / "scripts" / "build-owui-context.py"
 DIGEST = ROOT / "scripts" / "owui-context-digest.json"
@@ -116,11 +124,76 @@ IO_EVENT_DENYLIST = frozenset(
 # is exactly why the no-I/O assertion is a DELTA SLICE over the audited window,
 # never a whole-list emptiness check.
 AUDIT_HITS: list[str] = []
+# asyncio's Windows wakeup is host runtime, not tool I/O. On Windows the event
+# loop's self-wakeup is a loopback socket PAIR built lazily at the first await
+# inside an audited window: bind(('127.0.0.1', 0)) asks the OS for an ephemeral
+# port, then connect() targets that port. Linux/macOS use os.pipe() for the
+# same wakeup and emit nothing denylisted — which is why these events only
+# ever red the Windows CI legs (run 35117831059: 7 audit failures, every one a
+# loopback bind-to-port-0 / connect-to-that-port pair, plus the `_socket`
+# import that machinery pulls in). The hook licenses the pattern NARROWLY:
+# each bind to a loopback port 0 issues exactly one license and each loopback
+# connect consumes one — a tool connecting to a real loopback service (without
+# first binding port 0 of its own) still lands in AUDIT_HITS, as does any
+# non-loopback socket event. Filtered events land in SELFPIPE_HITS instead,
+# sliced per window like AUDIT_HITS, because seeing the wakeup machinery run
+# is also what licenses dropping its `_socket` import from the strict
+# call-time-import assertions (cases 18/21).
+SELFPIPE_HITS: list[str] = []
+_SELFPIPE_LICENSES = 0
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def _reset_selfpipe_licenses() -> None:
+    """Zero the license balance so each audit window re-arms cleanly — a
+    window whose bind went unconsumed cannot silence a later window's real
+    loopback connect."""
+    global _SELFPIPE_LICENSES
+    _SELFPIPE_LICENSES = 0
+
+
+def _is_selfpipe_wakeup(event: str, args) -> bool:
+    """Narrow loopback-socketpair-wakeup predicate (see SELFPIPE_HITS above).
+
+    bind: the address is (loopback host, 0) — an ephemeral-port request, the
+    socketpair bootstrap signature. connect: a loopback host AND a license
+    issued by an in-window bind is still unspent. Anything else is False.
+    """
+    try:
+        address = args[1]
+    except (TypeError, IndexError, KeyError):
+        return False
+    if not isinstance(address, tuple) or len(address) < 2:
+        return False
+    if address[0] not in _LOOPBACK_HOSTS:
+        return False
+    if event == "socket.bind":
+        return address[1] == 0
+    return _SELFPIPE_LICENSES > 0
+
+
+def _flagged_call_time_imports(names: list[str], selfpipe_seen: bool) -> list[str]:
+    """Call-time import names minus the wakeup machinery's own `_socket` pull
+    — and ONLY that: `_socket` is dropped only when the same window actually
+    ran the socketpair machinery; imported with no wakeup events in the
+    window, it stays a flagged anomaly."""
+    if selfpipe_seen:
+        return [name for name in names if name != "_socket"]
+    return list(names)
 
 
 def _denylist_hook(event: str, args) -> None:
-    if event in IO_EVENT_DENYLIST:
-        AUDIT_HITS.append(f"{event}: {args!r}")
+    global _SELFPIPE_LICENSES
+    if event not in IO_EVENT_DENYLIST:
+        return
+    if event in ("socket.bind", "socket.connect") and _is_selfpipe_wakeup(event, args):
+        if event == "socket.bind":
+            _SELFPIPE_LICENSES += 1
+        else:
+            _SELFPIPE_LICENSES -= 1
+        SELFPIPE_HITS.append(f"{event}: {args!r}")
+        return
+    AUDIT_HITS.append(f"{event}: {args!r}")
 
 
 class RecordingEmitter:
@@ -815,12 +888,15 @@ def main() -> int:
 
     sys.addaudithook(_denylist_hook)
     window_start = len(AUDIT_HITS)
+    selfpipe_start = len(SELFPIPE_HITS)
+    _reset_selfpipe_licenses()
     builtins.__import__ = recording_import
     try:
         audited_brief = asyncio.run(Tools().get_design_brief("sankey"))
     finally:
         builtins.__import__ = real_import
     audited_window = AUDIT_HITS[window_start:]
+    selfpipe_window = SELFPIPE_HITS[selfpipe_start:]
     noio_ok = True
     if not audited_brief:
         noio_ok = False
@@ -831,14 +907,73 @@ def main() -> int:
             f"get_design_brief produced {len(audited_window)} audited I/O event(s) at call "
             f"time: {audited_window[:5]}"
         )
-    if imports_seen:
+    flagged_imports = _flagged_call_time_imports(imports_seen, bool(selfpipe_window))
+    if flagged_imports:
         noio_ok = False
         failures.append(
             "get_design_brief imported module(s) at call time: "
-            + ", ".join(sorted(set(imports_seen)))
+            + ", ".join(sorted(set(flagged_imports)))
         )
     if noio_ok:
         print("OK: get_design_brief performs zero audited I/O events and zero call-time imports (CTX-02)")
+
+    # 18b. Self-pipe filter self-test (Windows CI run 35117831059): the filter
+    #     must swallow exactly the host runtime's wakeup pair and nothing
+    #     else. Driven through the real hook with the exact event shapes from
+    #     that CI log — bind to ('127.0.0.1', 0), connect to ('127.0.0.1',
+    #     58154) — plus the negatives that must STAY flagged: an unlicensed
+    #     loopback connect (what a real loopback service connection looks
+    #     like), a non-loopback port-0 bind, and a non-loopback connect. The
+    #     socket object in args is a stand-in; the hook never inspects it.
+    #     The recorded negatives append to AUDIT_HITS before any later
+    #     window's start index, exactly like the benign pre-window traffic
+    #     the delta-slice design already tolerates.
+    class _LogSocket:
+        def __repr__(self) -> str:
+            return "<socket.socket fd=352, family=2, type=1, proto=0>"
+
+    selfpipe_test_ok = True
+    _reset_selfpipe_licenses()
+    hits_before = len(AUDIT_HITS)
+    selfpipe_before = len(SELFPIPE_HITS)
+    _denylist_hook("socket.bind", (_LogSocket(), ("127.0.0.1", 0)))
+    _denylist_hook("socket.connect", (_LogSocket(), ("127.0.0.1", 58154)))
+    if len(AUDIT_HITS) != hits_before or len(SELFPIPE_HITS) != selfpipe_before + 2:
+        selfpipe_test_ok = False
+        failures.append(
+            "the selfpipe filter did not swallow the wakeup pair from CI run 35117831059 "
+            f"(AUDIT_HITS +{len(AUDIT_HITS) - hits_before}, SELFPIPE_HITS "
+            f"+{len(SELFPIPE_HITS) - selfpipe_before})"
+        )
+    _denylist_hook("socket.connect", (_LogSocket(), ("127.0.0.1", 5432)))
+    _denylist_hook("socket.bind", (_LogSocket(), ("0.0.0.0", 0)))
+    _denylist_hook("socket.connect", (_LogSocket(), ("192.0.2.10", 443)))
+    recorded = AUDIT_HITS[hits_before:]
+    if len(recorded) != 3:
+        selfpipe_test_ok = False
+        failures.append(
+            "the selfpipe filter swallowed real I/O: the unlicensed loopback connect, the "
+            f"non-loopback bind and the non-loopback connect must all stay recorded, got "
+            f"{recorded}"
+        )
+    if _flagged_call_time_imports(["_socket", "json"], True) != ["json"]:
+        selfpipe_test_ok = False
+        failures.append(
+            "_socket was not dropped from a call-time import list in a window that ran "
+            "the wakeup machinery"
+        )
+    if _flagged_call_time_imports(["_socket"], False) != ["_socket"]:
+        selfpipe_test_ok = False
+        failures.append(
+            "_socket was dropped from a window with NO wakeup events — that import must "
+            "stay flagged"
+        )
+    _reset_selfpipe_licenses()
+    if selfpipe_test_ok:
+        print(
+            "OK: the selfpipe filter swallows exactly the wakeup pair — unlicensed "
+            "loopback and non-loopback socket I/O stay flagged (35117831059)"
+        )
 
     # 19. REL-01 raise seam on all four methods: an injected raiser must surface
     #     as a structured envelope and never propagate out of the call.
@@ -1159,6 +1294,8 @@ def main() -> int:
     absent_tool.valves.profiles_dir = str(Path(absent_holder.name) / "never-created")
     sys.addaudithook(_denylist_hook)
     window_start = len(AUDIT_HITS)
+    selfpipe_start = len(SELFPIPE_HITS)
+    _reset_selfpipe_licenses()
     builtins.__import__ = recording_validator_import
     try:
         audited_report = asyncio.run(audited_tool.validate_diagram(fixture_html))
@@ -1166,6 +1303,7 @@ def main() -> int:
     finally:
         builtins.__import__ = real_import
     audited_window = AUDIT_HITS[window_start:]
+    selfpipe_window = SELFPIPE_HITS[selfpipe_start:]
     d15_ok = True
     if not audited_report.startswith("PASS: 0 issues"):
         d15_ok = False
@@ -1186,11 +1324,14 @@ def main() -> int:
             f"time with no profile active (D-15 as narrowed in 05-02 — a stat call occurs, "
             f"os.path.exists, but stat is not in the denylist): {audited_window[:5]}"
         )
-    if validator_imports:
+    flagged_validator_imports = _flagged_call_time_imports(
+        validator_imports, bool(selfpipe_window)
+    )
+    if flagged_validator_imports:
         d15_ok = False
         failures.append(
             "validate_diagram imported module(s) at call time (D-15): "
-            + ", ".join(sorted(set(validator_imports)))
+            + ", ".join(sorted(set(flagged_validator_imports)))
         )
     if d15_ok:
         print(
@@ -2141,6 +2282,7 @@ def main() -> int:
         scoped_tool.valves.export_dir = scoped_tmp
         sys.addaudithook(_denylist_hook)
         window_start = len(AUDIT_HITS)
+        _reset_selfpipe_licenses()
         builtins.__import__ = recording_scoped_import
         try:
             scoped_report = asyncio.run(scoped_tool.export_diagram(png_markup, "html", "scoped"))
@@ -3156,6 +3298,7 @@ def main() -> int:
         purity_tool.valves.profiles_dir = purity_tmp
         sys.addaudithook(_denylist_hook)
         purity_start = len(AUDIT_HITS)
+        _reset_selfpipe_licenses()
         builtins.__import__ = recording_purity_import
         try:
             purity_report = asyncio.run(
