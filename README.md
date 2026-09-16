@@ -190,6 +190,58 @@ The shared skill lives at `skills/diagram-design/`. Pi discovers it through the 
 
 ---
 
+## OpenWebUI tool
+
+This fork also ships the design system as a single-file OpenWebUI Tool, `tools/diagram_design_tool.py`, so any chat model inside an OpenWebUI 0.6.x instance can produce validated, on-brand diagram artifacts — no Claude Code or other skill-capable runtime required. The file imports with zero third-party dependencies; PNG export is the only optional piece, and it needs a host-side playwright install.
+
+### Install
+
+1. Download [`tools/diagram_design_tool.py`](tools/diagram_design_tool.py) from this repository.
+2. In OpenWebUI, open **Admin Panel → Settings → Tools** (an administrator action; the exact click-path varies by release) and import the `.py` file as a new Tool.
+3. Optional, for PNG export only — on the OpenWebUI host:
+
+   ```bash
+   pip install "playwright==1.62.0" && playwright install --with-deps chromium
+   ```
+
+Without playwright the tool still loads; only the `png` tier degrades to a notice. There are no valves to configure out of the box — the three admin valves (`export_dir`, `max_export_bytes`, `profiles_dir`) keep their defaults.
+
+### Use
+
+The tool exposes four model-callable methods. In a normal chat, just ask in natural language ("make me a flowchart of our signup flow, validate it, then export it as HTML") and the model calls them; the intended loop is closed and self-correcting:
+
+```
+brief → author → validate (FAIL) → fix → validate (PASS) → export
+```
+
+| Method | What it does |
+|---|---|
+| `get_design_brief(diagram_type)` | Serves the design brief for one of the 40 types (upstream 2.6.x added `waterfall`) — layout conventions, anti-patterns, and the shared token/typography tables. Unknown keys return an error listing every valid key. |
+| `validate_diagram(html)` | Checks model-authored markup against skin-token, geometry, accessibility and network-egress rules; returns a `PASS:`/`FAIL:` markdown report. |
+| `export_diagram(html, format, name)` | Writes one artifact per call — `html` (default), `svg`, or `png` (playwright). `name` is slugged to `a-z0-9-` so it can't escape the export dir. |
+| `apply_brand_profile(tokens_json, url)` | Stores your palette (any of the 10 roles, hex values) per-user, so validation checks against *your* brand instead of the default palette. |
+
+To brand your diagrams: call `apply_brand_profile` with a JSON object like `{"ink": "#1a1a1a", "accent": "#0ea5e9"}` (or an `https://` URL serving the same JSON), then validate — off-brand colours fail, brand colours pass. Contrast and rendered-layout checks stay CI-only (see Limitations in the linked doc).
+
+Capability boundary: of upstream 2.6.x's additions, the tool serves the 40-type briefs, the shared style tables and validator acceptance of the new CJK font families — Excalidraw import and the export-block registry remain agent-skill capabilities and have no tool method.
+
+### Reconstructing an existing diagram
+
+When you hand the model a screenshot or photo of a diagram to rebuild, models tend to summarize the image instead of reading it exhaustively — content silently drops even though the model *can* see it. Two habits close that gap:
+
+1. **Attach the tool** (chat input → **+ → Tools → Diagram Design**) so brief → validate → export actually runs. Without it the model freestyles both content and style.
+2. **Ask for an inventory first.** A working prompt shape:
+
+   > First, list EVERY piece of text visible in this diagram (node names, edge labels, small captions, legend text), one per line, and every arrow as `A -> B (label)`. Then rebuild it as HTML+SVG so every listed item appears. Then validate the result and fix anything reported.
+
+   The inventory step forces exhaustive extraction before authoring; the compare-against-inventory step catches omissions the validator can't (it checks style rules, not content completeness — a pretty-but-incomplete diagram passes).
+
+Also prefer feeding the diagram's **source** (HTML/SVG/Markdown/Mermaid text) over a screenshot whenever you have it — text-in beats vision-in for fidelity.
+
+See [`docs/owui-tool.md`](docs/owui-tool.md) for the full method reference, the valve reference, a worked transcript of the whole loop, and the release-gate UAT checklist.
+
+---
+
 ## Onboarding — make it look like *your* brand
 
 The whole point: ship editorial-quality diagrams in **your** colors and typography, not a generic template.
